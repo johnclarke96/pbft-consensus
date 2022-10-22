@@ -4,13 +4,16 @@ use std::{
     io::{Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     thread, time,
-    sync::mpsc::{Sender, Receiver, channel}
+    sync::{
+        mpsc::{Sender, Receiver, channel},
+        Arc, Mutex
+    }
 };
 use thiserror::Error;
 
 pub type Port = u64;
-pub type Digest = Vec<Vec<u8>>;
-pub type Message = Vec<Vec<u8>>;
+//pub type Digest = Vec<Vec<u8>>;
+pub type Message = [u8; 50];
 
 // constants
 const CONNECTION_DELAY: u64 = 3000;
@@ -46,16 +49,37 @@ fn main() {
 }
 
 pub struct Node {
-    network_client: NetworkClient,
-    network_server: NetworkServer,
-    buffer: HashMap<Digest, Message>,
+    client_handle: thread::JoinHandle<()>,
+    server_handle: thread::JoinHandle<()>,
+    tx_message: Sender<Message>,
+    buffer: Arc<Mutex<Vec<Message>>>
 }
 
 impl Node {
-    pub fn spawn(local_port: Port, remote_ports: Vec<Port>, rx_message: Receiver<Vec<u8>>) -> Vec<thread::JoinHandle<()>> {
-        let server_handle = NetworkServer::spawn(local_port);
+    pub fn spawn(local_port: Port, remote_ports: Vec<Port>) -> Self {
+        let (tx_message, rx_message) = channel();
+        let buffer: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_handle = NetworkServer::spawn(local_port, buffer.clone());
         let client_handle = NetworkClient::spawn(remote_ports, rx_message);
-        vec![server_handle, client_handle]
+
+        Node {
+            client_handle,
+            server_handle,
+            tx_message,
+            buffer
+        }
+    }
+
+    pub fn send_message(&self, message: Message) -> Result<(), PBFTError> {
+        self.buffer.lock().unwrap().push(message);
+        match self.tx_message.send(message) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(PBFTError::MessageError)
+        }
+    }
+
+    pub fn get_buffer(&self) -> Vec<Message> {
+        self.buffer.lock().unwrap().clone()
     }
 }
 
@@ -63,16 +87,18 @@ impl Node {
 pub enum PBFTError {
     #[error("Client could not connect to server")]
     TcpConnectionError,
+    #[error("")]
+    MessageError,
 }
 
 pub struct NetworkClient {
     remote_ports: Vec<Port>,
     connections: HashMap<Port, TcpStream>,
-    rx_message: Receiver<Vec<u8>>
+    rx_message: Receiver<Message>
 }
 
 impl NetworkClient {
-    pub fn default(remote_ports: Vec<Port>, rx_message: Receiver<Vec<u8>>) -> Self {
+    pub fn default(remote_ports: Vec<Port>, rx_message: Receiver<Message>) -> Self {
         let connections = HashMap::new();
 
         NetworkClient {
@@ -82,7 +108,7 @@ impl NetworkClient {
         }
     }
 
-    pub fn spawn(remote_ports: Vec<Port>, rx_message: Receiver<Vec<u8>>) -> thread::JoinHandle<()> {
+    pub fn spawn(remote_ports: Vec<Port>, rx_message: Receiver<Message>) -> thread::JoinHandle<()> {
         let connections: HashMap<Port, TcpStream> = HashMap::new();
 
         let client_handle = thread::spawn(move || {
@@ -111,7 +137,7 @@ impl NetworkClient {
         }
     }
 
-    pub fn send_message(&mut self, port: Port, message: &Vec<u8>) {
+    pub fn send_message(&mut self, port: Port, message: &Message) {
         // NOTE: to modify a mutable value within a hashmap use get_mut
         let tcp_stream = self.connections.get_mut(&port).expect("Unable to get mutable reference to TcpStream");
         tcp_stream.write(message).expect("Failed to send message");
@@ -149,15 +175,16 @@ impl NetworkClient {
 
 pub struct NetworkServer {
     port: Port,
+    buffer: Arc<Mutex<Vec<Message>>>
 }
 
 impl NetworkServer {
-    pub fn spawn(port: Port) -> thread::JoinHandle<()> {
-        let server_handle = thread::spawn(move || NetworkServer { port }.run());
+    pub fn spawn(port: Port, buffer: Arc<Mutex<Vec<Message>>>) -> thread::JoinHandle<()> {
+        let server_handle = thread::spawn(move || NetworkServer { port, buffer }.run());
         server_handle
     }
 
-    pub fn run(&self) {
+    pub fn run(&mut self) {
         // create server binding
         let server = TcpListener::bind(format!("{}{}", "0.0.0.0:", self.port.to_string())).unwrap();
         println!("Server listening on port {}", self.port);
@@ -166,9 +193,10 @@ impl NetworkServer {
                 Ok(stream) => {
                     println!("My address: {}", stream.local_addr().unwrap());
                     println!("New connection: {}", stream.peer_addr().unwrap());
+                    let buffer = self.buffer.clone();
                     thread::spawn(move || {
                         // connection succeeded
-                        Self::handle_client(stream)
+                        Self::handle_client(stream, buffer)
                     });
                 }
                 Err(e) => {
@@ -179,7 +207,7 @@ impl NetworkServer {
         }
     }
 
-    fn handle_client(mut stream: TcpStream) {
+    fn handle_client(mut stream: TcpStream, buffer: Arc<Mutex<Vec<Message>>>) {
         let mut data = [0 as u8; 50]; // using 50 byte buffer
         while match stream.read(&mut data) {
             Ok(n) => {
@@ -187,6 +215,7 @@ impl NetworkServer {
                 // TODO: because this is synchronous, the stream is continuously queried and 99.9% of the time is empty
                 if n > 0 {
                     println!("Data output: {:?}", data);
+                    buffer.lock().unwrap().push(data);
                 }
                 true
             }
@@ -213,14 +242,20 @@ pub mod main_tests {
         io::{Write},
         net::TcpStream,
         thread, time,
-        sync::mpsc::channel
+        sync::{
+            mpsc::channel,
+            Arc, Mutex
+        }
+
     };
     pub type Port = u64;
+    pub type Message = [u8; 50];
 
     #[test]
     fn test_server_launch() {
         let port: Port = 9001;
-        let _ = NetworkServer::spawn(port);
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let _ = NetworkServer::spawn(port, buffer);
         // connect and send a message
         thread::spawn(move || {
             let remote_address = format!("{}{}", "127.0.0.1:", port);
@@ -242,9 +277,9 @@ pub mod main_tests {
         // connect to ports successfully
         let ports: Vec<Port> = vec![9000, 9001, 9002, 9003];
         let _: Vec<thread::JoinHandle<()>> =
-            ports.iter().map(|x| NetworkServer::spawn(*x)).collect();
-        let (_, rx_message) = channel::<Vec<u8>>();
-        let (_, rx1_message) = channel::<Vec<u8>>();
+            ports.iter().map(|x| NetworkServer::spawn(*x, Arc::new(Mutex::new(Vec::new())))).collect();
+        let (_, rx_message) = channel::<Message>();
+        let (_, rx1_message) = channel::<Message>();
         let _: thread::JoinHandle<()> = NetworkClient::spawn(ports, rx_message);
 
         thread::sleep(time::Duration::from_millis(5000));
@@ -253,7 +288,7 @@ pub mod main_tests {
         let remote_ports: Vec<Port> = vec![9004, 9005];
         let _: Vec<thread::JoinHandle<()>> = launch_ports
             .iter()
-            .map(|x| NetworkServer::spawn(*x))
+            .map(|x| NetworkServer::spawn(*x, Arc::new(Mutex::new(Vec::new()))))
             .collect();
         let connections: HashMap<Port, TcpStream> = HashMap::new();
 
@@ -271,14 +306,15 @@ pub mod main_tests {
         // connect to ports successfully
         let ports: Vec<Port> = vec![9000, 9001, 9002, 9003];
         let _: Vec<thread::JoinHandle<()>> =
-            ports.iter().map(|x| NetworkServer::spawn(*x)).collect();
-        let (_, rx_message) = channel::<Vec<u8>>();
+            ports.iter().map(|x| NetworkServer::spawn(*x, Arc::new(Mutex::new(Vec::new())))).collect();
+        let (_, rx_message) = channel::<Message>();
         let mut network_client = NetworkClient::default(ports, rx_message);
         network_client.attempt_connections().unwrap();
         // make sure servers launch
         thread::sleep(time::Duration::from_millis(1000));
         // send message from client
-        network_client.send_message(network_client.remote_ports[0], &vec![1]);
+        let message = &[0; 50];
+        network_client.send_message(network_client.remote_ports[0], message);
         // wait for response from server
         thread::sleep(time::Duration::from_millis(3000));
     }
@@ -287,14 +323,44 @@ pub mod main_tests {
     fn launch_node_and_send_msg() {
         let ports: Vec<Port> = vec![9000, 9001, 9002, 9003];
         let _: Vec<thread::JoinHandle<()>> =
-            ports.iter().map(|x| NetworkServer::spawn(*x)).collect();
-        let (tx_message, rx_message) = channel::<Vec<u8>>();
+            ports.iter().map(|x| NetworkServer::spawn(*x, Arc::new(Mutex::new(Vec::new())))).collect();
         let local_port: Port = 9004;
-        let _ = Node::spawn(local_port, ports, rx_message);
+        let node = Node::spawn(local_port, ports);
 
-        let msg: Vec<u8> = vec![1];
-        tx_message.send(msg).unwrap();
+        let messages: Vec<Message> = vec![[0; 50], [1; 50], [2; 50]];
+        for message in &messages {
+            node.send_message(*message).unwrap();
+        }
         thread::sleep(time::Duration::from_millis(6000));
+
+        assert_eq!(
+            node.get_buffer(),
+            messages
+        );
+    }
+
+    #[test]
+    fn launch_nodes_and_send_msgs() {
+        let ports: Vec<Port> = vec![9000, 9001, 9002, 9003];
+        let mut nodes: Vec<Node> = Vec::new();
+        for i in 0..ports.len() {
+            let local_port = ports[i];
+            let remote_ports = [&ports[0..i], &ports[i+1..]].concat();
+            nodes.push(Node::spawn(local_port, remote_ports));
+        }
+
+        let messages: Vec<Message> = vec![[0; 50], [1; 50], [2; 50]];
+        for message in &messages {
+            nodes[0].send_message(*message).unwrap();
+        }
+        thread::sleep(time::Duration::from_millis(6000));
+
+        for i in 0..ports.len() {
+            assert_eq!(
+                nodes[i].get_buffer(),
+                messages
+            );
+        }
     }
 }
 
